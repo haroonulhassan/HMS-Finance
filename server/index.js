@@ -1,29 +1,43 @@
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
-const { Auth, Event, Request } = require('./models');
+const { Auth, Event, Request } = require('./models'); // Ensure './models' path is correct
 
 const app = express();
-const PORT = 5000;
-const MONGO_URI = 'mongodb+srv://user:user123@cluster0.peqqawg.mongodb.net/';
+
+// Use environment variable for MONGO_URI (recommended)
+// CRITICAL FIX: Use process.env for MONGO_URI and remove hardcoded PORT.
+const MONGO_URI = process.env.MONGO_URI || 'mongodb+srv://user:user123@cluster0.peqqawg.mongodb.net/';
 
 app.use(cors());
-app.use(express.json({ limit: '50mb' })); // Increased limit for base64 images
+app.use(express.json({ limit: '50mb' }));
 
 // Database Connection
 let isDbConnected = false;
+let isSeeded = false; // Add state to ensure seeding only happens once per cold start
 
 const connectDB = async () => {
+  // Check connection state to prevent unnecessary reconnections on warm start
+  if (mongoose.connection.readyState === 1) {
+    isDbConnected = true;
+    return;
+  }
+  
   try {
     await mongoose.connect(MONGO_URI);
     isDbConnected = true;
     console.log('Connected to MongoDB');
-    seedAuth();
+
+    // Only seed the first time a connection is established after cold start
+    if (!isSeeded) {
+      await seedAuth();
+      isSeeded = true;
+    }
+
   } catch (err) {
     isDbConnected = false;
     console.error('MongoDB connection error:', err);
-    // Retry connection after 5 seconds
-    setTimeout(connectDB, 5000);
+    // CRITICAL FIX: Removed setTimeout() to prevent Vercel process from hanging/timing out.
   }
 };
 
@@ -37,7 +51,8 @@ mongoose.connection.on('reconnected', () => {
   console.log('MongoDB reconnected');
 });
 
-connectDB();
+// Call connectDB globally so Vercel can attempt connection on cold start. 
+connectDB(); 
 
 // Seed Initial Data
 const seedAuth = async () => {
@@ -55,22 +70,30 @@ const seedAuth = async () => {
   }
 };
 
-// Middleware to check DB connection
+// Middleware to ensure DB connection is active for every request
 const checkDbConnection = (req, res, next) => {
-  if (!isDbConnected) {
-    // Allow health check even if DB is down, but for now we want to signal DB status
-    // If you want app to load without DB, skip this for health check. 
-    // But strictly speaking, if DB is down, app functionality is 503.
-    return res.status(503).json({ error: 'Database disconnected' });
+  if (!isDbConnected || mongoose.connection.readyState !== 1) {
+    // Re-attempt connection synchronously (blocking) for the current request
+    connectDB()
+      .then(() => {
+        if (!isDbConnected) {
+           return res.status(503).json({ error: 'Database disconnected' });
+        }
+        next();
+      })
+      .catch(() => {
+        return res.status(503).json({ error: 'Database disconnected' });
+      });
+  } else {
+    next();
   }
-  next();
 };
 
 app.use('/api', checkDbConnection); // Only apply to API routes
 
-// --- Routes ---
+// --- Routes (All routes remain unchanged) ---
 
-// Health Check Endpoint (Placed before auth to ensure it's accessible)
+// Health Check Endpoint
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok' });
 });
@@ -297,6 +320,5 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Internal Server Error' });
 });
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+// CRITICAL FIX: Export the app instance for Vercel's Serverless Function runtime.
+module.exports = app;
