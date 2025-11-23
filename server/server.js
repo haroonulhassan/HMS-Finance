@@ -1,0 +1,1 @@
+// Server code removed. App is now client-side using IndexedDB.

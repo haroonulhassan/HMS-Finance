@@ -1,0 +1,5 @@
+{
+  "name": "HMS Finance Management System",
+  "description": "A responsive finance management system for HMS with dashboard, event tracking, and PDF reporting.",
+  "requestFramePermissions": []
+}
