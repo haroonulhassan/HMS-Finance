@@ -1,101 +1,83 @@
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
-const { Auth, Event, Request } = require('./models'); // Ensure './models' path is correct
+// Ensure './models' path is correct relative to this file
+const { Auth, Event, Request } = require('./models'); 
 
 const app = express();
 
-// Use environment variable for MONGO_URI (recommended)
-// CRITICAL FIX: Use process.env for MONGO_URI and remove hardcoded PORT.
+// --- CRITICAL SERVERLESS OPTIMIZATION ---
+// 1. Use process.env.MONGO_URI for deployment security.
 const MONGO_URI = process.env.MONGO_URI || 'mongodb+srv://user:user123@cluster0.peqqawg.mongodb.net/';
+// 2. Cache the DB connection promise/object for reuse across warm starts.
+let cachedDb = null; 
+let isSeeded = false; // Flag to ensure seeding runs only once per cold start
 
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
-// Database Connection
-let isDbConnected = false;
-let isSeeded = false; // Add state to ensure seeding only happens once per cold start
-
+// Database Connection Logic optimized for Serverless
 const connectDB = async () => {
-  // Check connection state to prevent unnecessary reconnections on warm start
-  if (mongoose.connection.readyState === 1) {
-    isDbConnected = true;
-    return;
-  }
-  
-  try {
-    await mongoose.connect(MONGO_URI);
-    isDbConnected = true;
-    console.log('Connected to MongoDB');
-
-    // Only seed the first time a connection is established after cold start
-    if (!isSeeded) {
-      await seedAuth();
-      isSeeded = true;
+    // Check if the connection is already cached and ready
+    if (cachedDb && mongoose.connection.readyState === 1) {
+        console.log('Using cached MongoDB connection.');
+        return; // Connection is good, exit early
     }
 
-  } catch (err) {
-    isDbConnected = false;
-    console.error('MongoDB connection error:', err);
-    // CRITICAL FIX: Removed setTimeout() to prevent Vercel process from hanging/timing out.
-  }
+    try {
+        // Establish a new connection and cache it
+        const db = await mongoose.connect(MONGO_URI);
+        cachedDb = db.connection; 
+        console.log('Established new MongoDB connection.');
+
+        // Only run seedAuth() once on the first successful connection (cold start)
+        if (!isSeeded) {
+            await seedAuth();
+            isSeeded = true;
+            console.log('Initial data seeding complete.');
+        }
+    } catch (err) {
+        // Clear cache and re-throw error for the caller to handle (e.g., return 503)
+        cachedDb = null;
+        console.error('MongoDB connection error:', err);
+        throw new Error('Database connection failed.'); 
+    }
 };
 
-mongoose.connection.on('disconnected', () => {
-  isDbConnected = false;
-  console.log('MongoDB disconnected');
-});
-
-mongoose.connection.on('reconnected', () => {
-  isDbConnected = true;
-  console.log('MongoDB reconnected');
-});
-
-// Call connectDB globally so Vercel can attempt connection on cold start. 
-connectDB(); 
-
-// Seed Initial Data
+// Seed Initial Data (Remains the same)
 const seedAuth = async () => {
-  try {
-    const admin = await Auth.findOne({ role: 'admin' });
-    if (!admin) await Auth.create({ role: 'admin', username: 'Raiha Iman', password: 'admin' });
-    
-    const user = await Auth.findOne({ role: 'user' });
-    if (!user) await Auth.create({ role: 'user', username: 'user', password: 'password' });
+    try {
+        const admin = await Auth.findOne({ role: 'admin' });
+        if (!admin) await Auth.create({ role: 'admin', username: 'Raiha Iman', password: 'admin' });
+        
+        const user = await Auth.findOne({ role: 'user' });
+        if (!user) await Auth.create({ role: 'user', username: 'user', password: 'password' });
 
-    const assistant = await Auth.findOne({ role: 'assistant' });
-    if (!assistant) await Auth.create({ role: 'assistant', username: 'assi', password: 'assi' });
-  } catch (e) {
-    console.log("Seeding error", e);
-  }
+        const assistant = await Auth.findOne({ role: 'assistant' });
+        if (!assistant) await Auth.create({ role: 'assistant', username: 'assi', password: 'assi' });
+    } catch (e) {
+        console.log("Seeding error", e);
+    }
 };
 
 // Middleware to ensure DB connection is active for every request
 const checkDbConnection = (req, res, next) => {
-  if (!isDbConnected || mongoose.connection.readyState !== 1) {
-    // Re-attempt connection synchronously (blocking) for the current request
+    // Attempt connection on every request. If cached, this is a very fast check.
     connectDB()
-      .then(() => {
-        if (!isDbConnected) {
-           return res.status(503).json({ error: 'Database disconnected' });
-        }
-        next();
-      })
-      .catch(() => {
-        return res.status(503).json({ error: 'Database disconnected' });
+      .then(() => next())
+      .catch((error) => {
+        // If connectDB fails, return 503 Service Unavailable
+        return res.status(503).json({ error: error.message || 'Database disconnected' });
       });
-  } else {
-    next();
-  }
 };
 
-app.use('/api', checkDbConnection); // Only apply to API routes
+app.use('/api', checkDbConnection); // Apply DB check to all API routes
 
-// --- Routes (All routes remain unchanged) ---
+// --- Routes ---
 
 // Health Check Endpoint
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok' });
+  res.json({ status: 'ok', db: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected' });
 });
 
 // Auth
@@ -241,6 +223,7 @@ app.put('/api/events/:id/transactions/:txId', async (req, res) => {
 
     const idx = event.transactions.findIndex(t => t.id === req.params.txId);
     if (idx !== -1) {
+      // Use toObject() for safety before merging updates
       event.transactions[idx] = { ...event.transactions[idx].toObject(), ...req.body };
       await event.save();
     }
@@ -311,6 +294,7 @@ app.post('/api/requests/mark-read', async (req, res) => {
 
 // Handle 404 (Ensure JSON response)
 app.use((req, res) => {
+  // This will only handle 404s for the API routes, not the frontend
   res.status(404).json({ error: 'API Endpoint Not Found' });
 });
 
